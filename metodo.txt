@@ -1,0 +1,334 @@
+                    //SRIFSM
+                    if (SRIFSM.equals(result.getType())) {
+                        errMsg = "Error processing SRIFSM";
+                        log.info("Processing SRIFSM result");
+
+                        if (STATE_0.equals(result.getState())) {
+                            log.info("Processing SRIFSM result with state 0");
+                            procesarPrefijos(result);
+
+                            if (!(sondaRequest.getType().equals(SondaRequestEnum.SRIFSM_ONCE.getIdentifier()))) {
+                                log.info("Checking if PSIRes and IDR are OK or if line is in Roaming");
+
+                                boolean psiOk = false;
+                                boolean existPsi = false;
+                                boolean idrOk = false;
+                                boolean existIdr = false;
+
+                                // Check PSI and IDR results
+                                for (SondaResult sondaResult : sondaRequest.getResults()) {
+                                    if (sondaResult.getType().equals("PSI")) {
+                                        existPsi = true;
+                                        if (sondaResult.getState().equals("0")) {
+                                            psiOk = true;
+                                        } else {
+                                            sondaRequest.setState(1);
+                                        }
+                                    }
+                                    if (sondaResult.getType().equals("IDR")) {
+                                        existIdr = true;
+                                        if (sondaResult.getState().equals("0")) {
+                                            idrOk = true;
+                                        } else {
+                                            sondaRequest.setState(1);
+                                        }
+                                    }
+                                }
+
+                                String ccGtMsc = getInternationalCode(result.getMscgt());
+                                String ccGtMsisdn = getInternationalCode(result.getMsisdn());
+
+                                if (((!psiOk || !existPsi) || (!idrOk || !existIdr)) && (ccGtMsc != null && ccGtMsisdn != null && !ccGtMsc.equals(ccGtMsisdn))) {
+                                    log.info("Line is in Roaming, updating country");
+                                    Country country = null;
+
+                                    try {
+                                        country = getCountry(result.getMscgt());
+                                    } catch (Exception e) {
+                                        log.error("País no encontrado para GT: {}", result.getVlrgt());
+                                    }
+
+                                    sondaRequest.setCountry(country);
+                                }
+                            }
+
+                        } else if (STATE_1.equals(result.getState())) {
+                            log.info("Processing SRIFSM result with state 1");
+                            sondaRequest.setState(-1);
+                        }
+                    }
+                    //PSI o ATI
+                    else if (PSI.equals(result.getType()) || ATI.equals(result.getType())) {
+                        errMsg = "Error processing PSI or ATI";
+                        log.info("Processing PSI or ATI result");
+
+                        if (STATE_0.equals(result.getState())) {
+                            log.info("Processing result with state 0");
+
+                            result = getCellLocation(result);
+                            log.debug("{} Operation [{}] -> OK", transactionId, result.getType());
+                            sondaRequest.setState(2);
+
+                            // Add rel IMSI_NODO
+                            try {
+                                String imsi = result.getImsi();
+                                String mscGt = result.getMscgt();
+                                MccMnc mccMncAux = operatorService.getMccMncFromImsi(imsi);
+                                if (mscGt.equals("") && result.getMsc_list() != null) {
+                                    mscGt = result.getMsc_list().get(result.getMsc_list().size() - 1).getGt();
+                                }
+                                if (imsi != null && mscGt != null) {
+                                    ImsiNodo imsiNodo = new ImsiNodo(imsi, mscGt, null, mccMncAux.getMcc(), mccMncAux.getMnc(), "MSC", LocalDateTime.now());
+                                    imsiNodoService.insertImsiNodo(imsiNodo);
+                                }
+                            } catch (Exception e) {
+                                log.info("Unable to update IMSI / NODO relation");
+                            }
+
+                            // Programada
+                            programadaRequest(transactionId, sondaRequest);
+
+                            // Set country for PSIReq result
+                            Country country = null;
+                            try {
+                                country = getCountry(result.getVlrgt());
+                            } catch (Exception e) {
+                                log.error("País no encontrado para GT: {}", result.getVlrgt());
+                            }
+
+                            sondaRequest.setCountry(country);
+                            if (country != null) {
+                                log.debug("{} Setting country '{}' with prefix '{}' to response of request '{}'", transactionId, country.getName(), country.getInternationalCode(), sondaRequest.getId());
+                            }
+
+                        } else if (sondaRequest.getState() != -4 && STATE_1.equals(result.getState()) && sondaRequest.getTriggerName() != null) {
+                            log.info("Processing result with state 1");
+
+                            Boolean existsSRI = sondaResultRepository.existsByRequestId(sondaRequest);
+
+                            // Programada
+                            if (sondaRequest.getTriggerName() != null && !existsSRI) {
+                                // Delete PSIReq/IDRReq
+                                sondaRequestRepository.deleteById(sondaRequest.getId());
+                                // Retry SRIReq
+                                writeSriRequest(sondaRequest, result);
+                            }
+
+                            sondaRequest.setState(-4);
+
+                            // Retry with another technology if possible
+                            if (!sondaRequest.getResults().isEmpty() && sondaRequest.getTriggerName() != null) {
+                                SondaResult resultAux = sondaRequest.getResults().get(0);
+                                if (restrictionsService.isRestricted(resultAux.getMnc(), sondaRequest.getResults().get(0).getMcc(), DIAMETER)) {
+                                    sondaRequest.setState(-2);
+                                } else {
+                                    log.info("Retrying with Diameter");
+                                    sondaRequest.setType(SondaRequestEnum.IDR.getIdentifier());
+                                    writeIdaRequest(result.getRequestId().getId(), resultAux, transactionId);
+                                }
+                            } else {
+                                sondaRequest.setState(-2);
+                            }
+
+                        } else if (sondaRequest.getFallback() && PSI.equals(result.getType())) {
+                            log.info("Fallback condition for PSI");
+
+                            sondaRequest.setFallback(false);
+                            sondaRequest.setState(-2);
+                            MccMnc mccMncAux = operatorService.getMccMncFromImsi(sondaRequest.getNumber());
+                            if (restrictionsService.isRestricted(mccMncAux.getMnc(), mccMncAux.getMcc(), "DIAMETER")) {
+                                sondaRequest.setState(-2);
+                            } else {
+                                isReintento = true;
+                                log.info("[FALLBACK] Retrying with DIAMETER");
+                                retraying = true;
+                                RequestFileWriterService requestFileWriterService = new RequestFileWriterService(appConfigService, sondaRequestRepository, mmeService, mscService, hssService, imsiNodoService, sondaResultJPARepository, operatorService, restrictionsService, sondaRequestJPARepository, reqNodoService);
+                                try {
+
+                                    Boolean priorityInConfig = "0".equals(appConfigService.getConfigurationMap().get("allowIgnoreBlackOrWhiteList").getValor());
+                                    requestFileWriterService.writeIDRReqFallback(transactionId, sondaRequest.getNumber(), sondaRequest.getName(), sondaRequest.getPriority(), priorityInConfig, "0", 0, sondaRequest.getUser(), sondaRequest.getMotivo(), sondaRequest.getComentarios());
+
+                                    // Update bulk query
+                                    if (masivasService.getBulkQueryByReqId(sondaRequest.getId()) != null) {
+                                        BulkQuery query = masivasService.getBulkQueryByReqId(sondaRequest.getId());
+                                        query.setLastupdated(LocalDateTime.now());
+                                        query.setType("IDR");
+                                        query.setReqTransactionId(transactionId);
+                                        query.setEstado(1);
+                                        masivasService.insertOrUpdateProgramming(query);
+                                    }
+                                } catch (IOException | JAXBException | CryptoException e) {
+                                    log.error("Error while writing the PSI fallback request to imsi {}", result.getImsi(), e.getCause());
+                                    isReintento = false;
+                                    e.printStackTrace();
+                                }
+                            }
+
+                        } else {
+                            log.info("Result with unknown state, setting sondaRequest state to -2");
+                            sondaRequest.setState(-2);
+                        }
+                    }
+                    //IDR
+                    else if (IDR.equals(result.getType())) {
+                        errMsg = "Error processing IDR";
+                        log.info("Processing IDR result");
+
+                        if (sondaRequest.getState() != -4 && "1".equals(result.getState()) && sondaRequest.getTriggerName() != null) {
+                            log.info("State is 1 and triggerName is not null");
+
+                            Boolean existsSRI = sondaResultRepository.existsByRequestId(sondaRequest);
+                            Boolean isImsi = programmingService.getProgrammingById(sondaRequest.getTriggerName()).getType().equals("IMSI");
+
+                            if (sondaRequest.getTriggerName() != null && !existsSRI && isImsi) {
+                                log.info("Retrying SRIReq due to IMSI");
+
+                                // Delete PSIReq / IDRReq
+                                sondaRequestRepository.deleteById(sondaRequest.getId());
+
+                                // Retry SRIReq
+                                writeSriRequest(sondaRequest, result);
+                            } else if ("1".equals(result.getState()) && !isImsi) {
+                                sondaRequest.setState(-4);
+
+                                if (!sondaRequest.getResults().isEmpty()) {
+                                    log.info("Attempting retry with SS7");
+
+                                    SondaResult resultAux = sondaRequest.getResults().get(0);
+                                    // Retry with another technology if possible
+                                    if (restrictionsService.isRestricted(resultAux.getMnc(), sondaRequest.getResults().get(0).getMcc(), "SS7")) {
+                                        sondaRequest.setState(-2);
+                                    } else {
+                                        log.info("Retrying with SS7");
+                                        sondaRequest.setType(SondaRequestEnum.PSI.getIdentifier());
+                                        writePsiRequest(result.getRequestId().getId(), resultAux, transactionId);
+                                    }
+                                } else {
+                                    sondaRequest.setState(-2);
+                                }
+                            } else {
+                                sondaRequest.setState(-2);
+                            }
+                        } else if ("0".equals(result.getState())) {
+                            log.info("State is 0, processing IDR result as OK");
+
+                            result = getCellLocation(result);
+                            log.debug("{} Operation [{}] -> OK", transactionId, result.getType());
+                            sondaRequest.setState(2);
+
+                            // Scheduled request
+                            programadaRequest(transactionId, sondaRequest);
+
+                            Country country = null;
+                            try {
+                                country = getOperator(mccMnc).getCountry();
+                            } catch (Exception e) {
+                                log.error("País no encontrado para MCC {}", result.getMcc());
+                            }
+                            sondaRequest.setCountry(country);
+
+                            if (country != null) {
+                                log.debug("{} Setting country '{}' with prefix '{}' to response of request '{}'", transactionId, country.getName(), country.getInternationalCode(), sondaRequest.getId());
+                            }
+
+                            // Add IMSI_NODO relation
+                            try {
+                                String imsi = result.getImsi();
+                                String mmeHost = result.getMmeHost();
+                                String mmeRealm = result.getMmeRealm();
+                                MccMnc mccMncAux = operatorService.getMccMncFromImsi(imsi);
+
+                                if (imsi != null && mmeHost != null) {
+                                    ImsiNodo imsiNodo = new ImsiNodo(imsi, mmeHost, mmeRealm, mccMncAux.getMcc(), mccMncAux.getMnc(), "MME", LocalDateTime.now());
+                                    imsiNodoService.insertImsiNodo(imsiNodo);
+                                }
+                            } catch (Exception e) {
+                                log.info("Failed to update IMSI / NODO relation");
+                            }
+
+                            ServiceParameters parameters = new ServiceParameters();
+                            parameters.getParamsMap().put("hostname", result.getMmeHost());
+                            parameters.getParamsMap().put("realm", result.getMmeRealm());
+                            parameters.getParamsMap().put("priority", 1);
+                            parameters.getParamsMap().put(ControllerConstants.MCC_MNC, mccMnc);
+                        } else if (sondaRequest.getFallback()) {
+                            log.info("Fallback condition met");
+                            boolean isSri = false;
+                            if(sondaRequest.getType().equals(SondaRequestEnum.SRIFSM.getIdentifier())){
+                                if(!sondaResultRepository.findByRequestId(sondaRequest).isEmpty()){
+                                    switch (sondaResultRepository.findByRequestId(sondaRequest).get(0).getType()) {
+                                        case SRIFSM:
+                                            isSri = true;
+                                            break;
+                                    }
+                                }
+                            }
+                            String number = "";
+                            sondaRequest.setFallback(false);
+                            if(isSri){
+                                number = sondaResultRepository.findByRequestId(sondaRequest).get(0).getImsi();
+                            }else{
+                                sondaRequest.setState(-2);
+                                number = sondaRequest.getNumber();
+                            }
+
+                            MccMnc mccMncAux = operatorService.getMccMncFromImsi(number);
+
+                            if (restrictionsService.isRestricted(mccMncAux.getMnc(), mccMncAux.getMcc(), "SS7")) {
+                                sondaRequest.setState(-2);
+                            } else {
+                                isReintento = true;
+                                log.info("[FALLBACK] Retrying with SS7");
+                                retraying = true;
+                                RequestFileWriterService requestFileWriterService = new RequestFileWriterService(appConfigService, sondaRequestRepository, mmeService, mscService, hssService, imsiNodoService, sondaResultJPARepository, operatorService, restrictionsService, sondaRequestJPARepository, reqNodoService);
+
+                                try {
+                                    Boolean priorityInConfig = "0".equals(appConfigService.getConfigurationMap().get("allowIgnoreBlackOrWhiteList").getValor());
+                                    requestFileWriterService.writePSIReqFallback(transactionId, number, sondaRequest.getName(), sondaRequest.getPriority(), priorityInConfig, "0", 0, sondaRequest.getUser(), sondaRequest.getMotivo(), sondaRequest.getComentarios());
+
+                                    // Update bulk query
+                                    if (masivasService.getBulkQueryByReqId(sondaRequest.getId()) != null) {
+                                        BulkQuery query = masivasService.getBulkQueryByReqId(sondaRequest.getId());
+                                        query.setLastupdated(LocalDateTime.now());
+                                        query.setType("PSI");
+                                        query.setReqTransactionId(transactionId);
+                                        query.setEstado(1);
+                                        masivasService.insertOrUpdateProgramming(query);
+                                    }
+                                } catch (IOException | JAXBException | CryptoException e) {
+                                    log.error("Error while writing the PSI fallback request to IMSI {}", result.getImsi(), e.getCause());
+                                    isReintento = false;
+                                    e.printStackTrace();
+                                }
+                            }
+                        } else {
+                            sondaRequest.setState(-2);
+                        }
+                    }
+                    //ULR
+                    else if (ULR.equals(result.getType())) {
+                        result.setFile(file.getName());
+                        // Save to Database
+                        try {
+                            log.debug("{} Saving to data base", transactionId);
+                            sondaResultJPARepository.saveAndFlush(result);
+                        } catch (JpaSystemException je) {
+                            je.printStackTrace();
+                        } catch (Exception e) {
+                            log.error(e.getMessage());
+                        }
+                    } else {
+                        sondaRequest.setState(-3);
+                    }
+
+
+                    if (!(("PSI".equals(result.getType()) ||
+                            "ATI".equals(result.getType())) &&
+                            "1".equals(result.getState())
+                            && sondaRequest.getTriggerName() != null
+                            && !sondaResultRepository.existsByRequestId(sondaRequest))) {
+
+                        processAndSaveRequestResult(sondaRequest,result, sondaRequestJPARepository,
+                                sondaResultJPARepository, file, isReintento, tecnologia,
+                                restrictionsService, transactionId, retraying);
+                    }
